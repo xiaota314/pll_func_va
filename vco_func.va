@@ -1,0 +1,115 @@
+//
+// Voltage-controlled oscillator with white accumulating timing jitter
+//
+// phase = 2*pi*integral(freq_eff), wrapped to [-pi,pi). The phase starts at 0,
+// so n would be high at the DC operating point; the operating point and the
+// first transient sample are forced low instead (see the start-up block).
+// The output then ramps up at the start of the transient, the first falling
+// edge sits at T/4 and the first output period is 3/4 of T. Every later
+// period is a full T with a 50 % duty cycle.
+// The output is derived directly from phase, so a missed cross event cannot
+// leave the output stuck. jitter is RMS period jitter; two independent updates
+// per period use sqrt(2) scaling. Keep jitter << 0.25/fmax for near-Gaussian
+// behavior; the denominator guard only prevents numerical blow-up.
+//
+
+// Note on the parameter ranges: (vmin:inf) and (fmin:inf) are OPEN intervals,
+// so vmax == vmin and fmax == fmin are already rejected at elaboration. The
+// frequency denominator can therefore never be zero.
+//
+// $bound_step() applies to the whole circuit, not just to this instance: with
+// several oscillators the tightest bound wins and the global time step shrinks.
+// Set bound_step_enable=0 on instances whose phase does not need resolving
+// (for example an unused replica) to avoid slowing the rest of the netlist.
+//
+
+`include "constants.vams"
+`include "disciplines.vams"
+
+module vco_func (out, in);
+
+input in;  voltage in;
+output out; voltage out;
+
+parameter real vmin = 0;
+parameter real vmax = vmin+1 from (vmin:inf);
+parameter real fmin = 1 from (1n:inf);
+parameter real fmax = 2*fmin from (fmin:inf);
+parameter real Voh = 1.0;
+parameter real Vol = 0.0;
+parameter real Trf = 0.01/fmax from (0:inf);
+parameter real Ttol = 1m/fmax from (0:0.1/fmax);
+parameter real jitter = 0 from [0:0.25/fmax);
+parameter integer Noise_ON = 1 from [0:1];
+parameter integer points_per_period = 20 from [4:inf);
+parameter integer bound_step_enable = 0 from [0:1];   // 0 = do not constrain the global time step
+parameter integer seed_init = -561;
+
+real freq, freq_eff, phase, dT, denom, max_step, t_first;
+integer n, seed;
+
+analog begin
+    @(initial_step) begin
+        seed = seed_init;
+        dT   = 0.0;
+        n    = 0;
+        t_first = 0.0;
+    end
+
+    // Record the first transient time point so the DC/initial-state fix below
+    // also covers a transient that starts at a non-zero time (tran start != 0).
+    // For the usual start=0 this leaves t_first at 0 and changes nothing.
+    @(initial_step("tran"))
+        t_first = $abstime;
+
+    // Linear V/f conversion, bounded before adding period jitter.
+    freq = (V(in)-vmin)*(fmax-fmin)/(vmax-vmin) + fmin;
+    if (freq > fmax)
+        freq = fmax;
+    if (freq < fmin)
+        freq = fmin;
+
+    // Convert a sampled period perturbation to instantaneous frequency.
+    denom = 1.0 + dT*freq;
+    if (denom < 0.5)
+        denom = 0.5;
+    freq_eff = freq/denom;
+    if (freq_eff < 1n)
+        freq_eff = 1n;
+
+    // Resolve both phase crossings and output transitions. The original
+    // 0.05/freq bound can be too coarse when Trf is much smaller than 1/freq.
+    max_step = 1.0/(points_per_period*freq_eff);
+    if (max_step > 0.5*Trf)
+        max_step = 0.5*Trf;
+    if (bound_step_enable != 0)
+        $bound_step(max_step);
+
+    phase = 2*`M_PI*idtmod(freq_eff, 0.0, 1.0, -0.5);
+
+    // One shared event block avoids duplicated jitter code.
+    @(cross(phase+`M_PI/2, +1, Ttol) or
+      cross(phase-`M_PI/2, +1, Ttol)) begin
+        if ((Noise_ON != 0) && (jitter > 0.0))
+            dT = `M_SQRT2*jitter*$rdist_normal(seed, 0.0, 1.0);
+        else
+            dT = 0.0;
+        $discontinuity(0);
+    end
+
+    // Start-up. The phase is 0 as long as the idtmod integral has not
+    // accumulated yet - that is the case at the DC operating point and at the
+    // first transient sample - so n would be 1 and the output would sit at
+    // Voh. Both samples are forced low, so the operating point and the
+    // waveform agree at Vol and the output ramps up to Voh with Trf instead
+    // of stepping. Consequence of the 0 start phase: the first rising edge
+    // is the start of the transient, the first falling edge is at T/4, and
+    // the first output period is 3/4 of T.
+    if (($abstime <= 0.0) || ($abstime <= t_first))
+        n = 0;
+    else
+        n = (phase >= -`M_PI/2 && phase < `M_PI/2);
+    V(out) <+ transition(n ? Voh : Vol, 0, Trf, Trf);
+end
+
+endmodule

@@ -1,0 +1,188 @@
+// Rising-edge PFD with independent UP/DN latches and a charge pump.
+// I(out) is positive INTO the module: UP sources, DN sinks.
+// ref sets UP; fb sets DN. Repeated edges on a set latch are ignored.
+// BOTH set schedules one common reset after Treset, without retriggering.
+// Treset=0 is the ideal zero-overlap limit of the LATCH only. The charge
+// response is still limited by Trf_up/Trf_dn: for |dt| < Trf the pulse is a
+// triangle and Q=iup*dt^2/Trf, so the model has a dead zone of about +-Trf.
+// Treset>0 creates overlap, NOT a dead zone. This replaces the former
+// turn-on-delay semantics.
+// For an isolated pair with ref leading by dt>=0:
+// Wup=dt+Treset; Wdn=Treset; Q=iup*(dt+Treset)-idn*Treset.
+// Matched ideal pumps give Q=Icp*dt, not Icp*(dt+Treset).
+// These expressions exclude smoothing, jitter, clamp and rout.
+//
+// Parameter constraints:
+//   Treset < Tref     at Treset == Tref every reference edge falls inside the
+//                     reset window, the net charge goes to zero and the loop
+//                     stalls; above Tref the gain drops to one half. Keep
+//                     Treset below the shortest reference period minus the
+//                     largest expected |dt|.
+//   Trf <= 1 ps       with Treset=0 the dead zone is +-Trf; with Treset>0 the
+//                     pulse area is compressed once Trf approaches Treset.
+//                     Trf=0 hands the dead zone to the simulator default.
+//   Tdly >= 5*jitter  otherwise the non-negative delay clip biases the mean
+//                     edge position (a runtime warning is issued).
+// At lock a residual (iup-idn)*Treset remains, so Treset also converts pump
+// mismatch into a static phase offset of about (di/i)*Treset.
+//
+// Edges during pending reset are absorbed and do not extend the timer.
+// At an exact reset-expiry/clock tie, reset is handled before the clock;
+// the new clock is accepted. This is a behavioral tie convention, not
+// a metastability/recovery model. A lone edge holds its pump on.
+// Tdly_ref/Tdly_fb delay BOTH edges of their respective output gate.
+// Trf_up/Trf_dn specify transition smoothing, NOT calibrated CP bandwidth.
+// Interrupted short pulses can lose area. Zero selects the simulator's
+// default transition time, not an ideal step. Ttol sets the crossing time
+// tolerance; the crossing voltage tolerance is fixed at 1 uV.
+// Noise is sampled only on actual gate changes. Distinct seeds are needed
+// for independent instances. Delays are clipped at zero; use path delay
+// >=5*jitter for negligible clipping and avoid noisy edge reordering.
+// Keep output in Vol..Voh; rclamp is out-of-range protection.
+
+`include "constants.vams"
+`include "disciplines.vams"
+
+module pfd_cp_func (out, ref, fb);
+
+output out; electrical out;
+input ref; voltage ref;
+input fb; voltage fb;
+
+parameter integer Noise_ON = 0 from [0:1];
+parameter real jitter = 0 from [0:inf);
+parameter real Voh = 1.0;
+parameter real Vol = 0.0;
+parameter real Vth = 0.5 from (Vol:Voh);
+parameter integer seed_init = 716;
+parameter real Ttol = 1p from (0:inf);
+parameter real Treset = 0 from [0:inf);
+parameter real Tdly_ref = 100p from [0:inf);
+parameter real Tdly_fb = 100p from [0:inf);
+parameter real Trf_up = 1p from [0:inf);
+parameter real Trf_dn = 1p from [0:inf);
+parameter real iup = 100u from [0:inf);
+parameter real idn = iup from [0:inf);
+parameter real kup_v = 0.0;
+parameter real kdn_v = 0.0;
+parameter real rout_up = 0.0 from [0:inf);
+parameter real rout_dn = 0.0 from [0:inf);
+
+localparam real rclamp = 10.0;
+localparam real gmin = 1p;
+
+integer up_state, dn_state, up_prev, dn_prev, reset_pending, seed;
+real reset_at, dt_up_edge, dt_dn_edge, tau_up, tau_dn;
+real up_gate, dn_gate, fac_up, fac_dn, ro_up, ro_dn;
+
+analog begin
+
+    // ---- initialization ----------------------------------------------
+    @(initial_step) begin
+        up_state      = 0;
+        dn_state      = 0;
+        up_prev       = 0;
+        dn_prev       = 0;
+        reset_pending = 0;
+        reset_at      = 1e12;
+        seed          = seed_init;
+        dt_up_edge    = 0.0;
+        dt_dn_edge    = 0.0;
+        // Constraints that cannot be expressed as parameter ranges.
+        if ((Noise_ON != 0) && (jitter > 0.0) && (Tdly_ref < 5.0*jitter))
+            $warning("pfd_cp_func: Tdly_ref < 5*jitter, the delay clip biases the mean edge");
+        if ((Noise_ON != 0) && (jitter > 0.0) && (Tdly_fb < 5.0*jitter))
+            $warning("pfd_cp_func: Tdly_fb < 5*jitter, the delay clip biases the mean edge");
+        if ((Treset > 0.0) && (Trf_up > 0.1*Treset))
+            $warning("pfd_cp_func: Trf_up > Treset/10, the UP pulse area is compressed");
+        if ((Treset > 0.0) && (Trf_dn > 0.1*Treset))
+            $warning("pfd_cp_func: Trf_dn > Treset/10, the DN pulse area is compressed");
+    end
+
+    // ---- reset expiry timer ------------------------------------------
+    // Reset is resolved before clock edges at the same time point.
+    // reset_at is only ever advanced forward (set to $abstime+Treset when a
+    // reset is scheduled); once the timer fires it is left at its expired
+    // value so the variable timer does not re-arm a spurious 1e12 s event.
+    @(timer(reset_at)) begin
+        if (reset_pending != 0) begin
+            up_state      = 0;
+            dn_state      = 0;
+            reset_pending = 0;
+        end
+    end
+
+    // ---- rising edges set the latches --------------------------------
+    @(cross(V(ref)-Vth, +1, Ttol, 1u)) begin
+        if (reset_pending == 0)
+            up_state = 1;
+    end
+    @(cross(V(fb)-Vth, +1, Ttol, 1u)) begin
+        if (reset_pending == 0)
+            dn_state = 1;
+    end
+
+    // ---- common reset, evaluated after BOTH edge handlers ------------
+    if ((up_state != 0) && (dn_state != 0) && (reset_pending == 0)) begin
+        if (Treset > 0.0) begin
+            reset_pending = 1;
+            reset_at      = $abstime + Treset;
+        end else begin
+            up_state = 0;
+            dn_state = 0;
+        end
+    end
+
+    // ---- sample noise only on actual gate transitions ----------------
+    if (up_state != up_prev) begin
+        if ((Noise_ON != 0) && (jitter > 0.0))
+            dt_up_edge = jitter*$rdist_normal(seed, 0.0, 1.0);
+        else
+            dt_up_edge = 0.0;
+        up_prev = up_state;
+    end
+    if (dn_state != dn_prev) begin
+        if ((Noise_ON != 0) && (jitter > 0.0))
+            dt_dn_edge = jitter*$rdist_normal(seed, 0.0, 1.0);
+        else
+            dt_dn_edge = 0.0;
+        dn_prev = dn_state;
+    end
+
+    // ---- gate delay + smoothing, clipped to non-negative -------------
+    tau_up = Tdly_ref + dt_up_edge;
+    if (tau_up < 0.0)
+        tau_up = 0.0;
+    tau_dn = Tdly_fb + dt_dn_edge;
+    if (tau_dn < 0.0)
+        tau_dn = 0.0;
+    up_gate = transition(up_state, tau_up, Trf_up, Trf_up);
+    dn_gate = transition(dn_state, tau_dn, Trf_dn, Trf_dn);
+
+    // ---- output-voltage dependence of the pump current ---------------
+    fac_up = 1.0 + kup_v*(V(out)-(Voh+Vol)/2);
+    if (fac_up < 0.0)
+        fac_up = 0.0;
+    fac_dn = 1.0 + kdn_v*(V(out)-(Voh+Vol)/2);
+    if (fac_dn < 0.0)
+        fac_dn = 0.0;
+
+    // ---- finite output resistance (off when rout == 0) ---------------
+    ro_up = 0.0;
+    if (rout_up > 0.0)
+        ro_up = (V(out)-Voh)/rout_up;
+    ro_dn = 0.0;
+    if (rout_dn > 0.0)
+        ro_dn = (V(out)-Vol)/rout_dn;
+
+    // ---- output current contributions --------------------------------
+    I(out) <+ up_gate*(-iup*fac_up + ro_up);   // UP: source
+    I(out) <+ dn_gate*( idn*fac_dn + ro_dn);   // DN: sink
+    if (V(out) > Voh)
+        I(out) <+ (V(out)-Voh)/rclamp;         // out-of-range clamp (high)
+    else if (V(out) < Vol)
+        I(out) <+ (V(out)-Vol)/rclamp;         // out-of-range clamp (low)
+    I(out) <+ gmin*V(out);                     // tiny conductance, keeps node finite
+
+end
+endmodule

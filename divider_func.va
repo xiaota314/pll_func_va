@@ -1,0 +1,138 @@
+//
+// Programmable frequency divider with synchronous edge jitter
+//
+// Counting is fixed to rising input edges: invert the input clock in the
+// netlist if a falling-edge divider is needed.
+// ratio_in[9:0]: N = 1..1023 selects divide-by-N; code 0 is invalid.
+// A new ratio is sampled on each selected input edge, but becomes active only
+// at the next divided-output cycle boundary. Divide-by-1 is a true bypass.
+// The bus is already valid at the DC operating point, so it is also sampled at
+// start-up: the divider powers up directly at the programmed ratio, with no
+// bypass start-up phase and no separate start-up parameter. An all-zero bus at
+// start-up is an invalid code and falls back to N=2; during normal operation
+// code 0 is simply ignored and the current ratio is kept.
+// For nearly Gaussian delay jitter, use Tdly >= 5*jitter; otherwise the
+// non-negative delay guard truncates the distribution and biases the mean.
+//
+
+`include "constants.vams"
+`include "disciplines.vams"
+
+module divider_func (out, in, ratio_in);
+
+output out; voltage out;
+input  in;  voltage in;
+input  [9:0] ratio_in; voltage [9:0] ratio_in;
+
+parameter real Voh = 1.0;
+parameter real Vol = 0.0;
+parameter real Vth = (Voh+Vol)/2;
+parameter real Trf = 10p from (0:inf);
+parameter real Tdly = 0 from [0:inf);
+parameter real jitter = 0 from [0:inf);
+parameter real Ttol = 1p from (0:inf);
+parameter integer Noise_ON = 0 from [0:1];
+parameter integer seed_init = -311;
+
+integer count, n, seed;
+integer ratio_now, ratio_req, ratio_code;
+real dt, tau, out_cmd;
+
+analog begin
+    @(initial_step) begin
+        seed      = seed_init;
+        count     = 0;
+        n         = 0;
+        dt        = 0.0;
+        // Sample the control bus immediately. The DC operating point already
+        // holds ratio_in, so the divider starts at the programmed ratio; code
+        // 0 is invalid and falls back to divide-by-2. Explicit bit sampling
+        // avoids variable analog-vector indexing, as in the edge block below.
+        ratio_code = 0;
+        if (V(ratio_in[0]) > Vth) ratio_code = ratio_code + 1;
+        if (V(ratio_in[1]) > Vth) ratio_code = ratio_code + 2;
+        if (V(ratio_in[2]) > Vth) ratio_code = ratio_code + 4;
+        if (V(ratio_in[3]) > Vth) ratio_code = ratio_code + 8;
+        if (V(ratio_in[4]) > Vth) ratio_code = ratio_code + 16;
+        if (V(ratio_in[5]) > Vth) ratio_code = ratio_code + 32;
+        if (V(ratio_in[6]) > Vth) ratio_code = ratio_code + 64;
+        if (V(ratio_in[7]) > Vth) ratio_code = ratio_code + 128;
+        if (V(ratio_in[8]) > Vth) ratio_code = ratio_code + 256;
+        if (V(ratio_in[9]) > Vth) ratio_code = ratio_code + 512;
+        ratio_now = (ratio_code != 0) ? ratio_code : 2;
+        ratio_req = ratio_now;
+    end
+
+    // Count selected input edges and synchronously sample the control bus.
+    @(cross(V(in)-Vth, +1, Ttol)) begin
+        // Explicit bit sampling avoids variable analog-vector indexing.
+        ratio_code = 0;
+        if (V(ratio_in[0]) > Vth) ratio_code = ratio_code + 1;
+        if (V(ratio_in[1]) > Vth) ratio_code = ratio_code + 2;
+        if (V(ratio_in[2]) > Vth) ratio_code = ratio_code + 4;
+        if (V(ratio_in[3]) > Vth) ratio_code = ratio_code + 8;
+        if (V(ratio_in[4]) > Vth) ratio_code = ratio_code + 16;
+        if (V(ratio_in[5]) > Vth) ratio_code = ratio_code + 32;
+        if (V(ratio_in[6]) > Vth) ratio_code = ratio_code + 64;
+        if (V(ratio_in[7]) > Vth) ratio_code = ratio_code + 128;
+        if (V(ratio_in[8]) > Vth) ratio_code = ratio_code + 256;
+        if (V(ratio_in[9]) > Vth) ratio_code = ratio_code + 512;
+
+        if (ratio_code != 0)
+            ratio_req = ratio_code;
+
+        if (ratio_now == 1) begin
+            count = 0;
+            if (ratio_req == 1) begin
+                n = (V(in) > Vth);
+            end else begin
+                // Start a complete divided cycle when leaving bypass.
+                ratio_now = ratio_req;
+                n = 0;
+            end
+        end else begin
+            count = count + 1;
+            if (count >= ratio_now) begin
+                // Complete the old cycle before activating a new ratio.
+                count = 0;
+                n = 0;
+                ratio_now = ratio_req;
+            end else begin
+                n = (2*count >= ratio_now);
+            end
+        end
+
+        if ((Noise_ON != 0) && (jitter > 0.0))
+            dt = jitter*$rdist_normal(seed, 0.0, 1.0);
+        else
+            dt = 0.0;
+        $discontinuity(0);
+    end
+
+    // In divide-by-1 mode both input edges reach the output. Sample the
+    // opposite edge too, so falling/rising bypass edges do not share stale
+    // jitter from the last selected edge. No extra draw occurs in N > 1 mode.
+    @(cross(V(in)-Vth, -1, Ttol)) begin
+        if (ratio_now == 1) begin
+            if ((Noise_ON != 0) && (jitter > 0.0))
+                dt = jitter*$rdist_normal(seed, 0.0, 1.0);
+            else
+                dt = 0.0;
+            $discontinuity(0);
+        end
+    end
+
+    // transition() requires a non-negative delay.
+    tau = Tdly + dt;
+    if (tau < 0.0)
+        tau = 0.0;
+
+    if (ratio_now == 1)
+        out_cmd = (V(in) > Vth) ? Voh : Vol;
+    else
+        out_cmd = n ? Voh : Vol;
+
+    V(out) <+ transition(out_cmd, tau, Trf, Trf);
+end
+
+endmodule
